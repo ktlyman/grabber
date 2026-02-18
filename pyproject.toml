@@ -1,0 +1,17 @@
+[project]
+name = "grabber"
+version = "0.1.0"
+description = "Download documents from systems like DocSend that prevent direct download"
+requires-python = ">=3.10"
+dependencies = [
+    "playwright>=1.40",
+    "img2pdf>=0.5",
+    "requests>=2.31",
+]
+
+[project.scripts]
+grabber = "grabber.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
