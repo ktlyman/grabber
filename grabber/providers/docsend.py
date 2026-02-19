@@ -397,116 +397,123 @@ class DocsendProvider(BaseProvider):
         return "/d/" not in path
 
     @staticmethod
-    def _enumerate_documents(page: Page) -> list[dict[str, str]]:
-        """Extract the document list from a DocSend dataroom page.
+    def _enumerate_current_folder(
+        page: Page,
+    ) -> dict[str, list[dict[str, str]]]:
+        """Extract documents and subfolders from the current page.
 
-        Reads React fiber props on card elements.  The ``folder`` prop
-        higher up the fiber tree contains the full folder structure
-        including ``contents.nodes`` (documents) and ``ancestors``
-        (parent folders).  Each returned dict has ``name``, ``href``,
-        and ``section`` (the local directory path for this document,
-        e.g. ``""`` for root or ``"SubFolder/Nested"``).
+        Scans **all** DOM elements for the ``folder`` React fiber prop
+        (type ``SpaceFolder``).  The ``folder.contents.nodes`` array
+        contains both ``SpaceDocument`` and ``SpaceFolder`` entries for
+        the currently-visible folder.
+
+        Returns ``{"docs": [...], "folders": [...]}`` where each doc
+        has ``name`` and ``href``, and each folder has ``name`` and
+        ``href``.
         """
-        docs: list[dict[str, str]] = page.evaluate(
+        return page.evaluate(
             """() => {
-            const cards = document.querySelectorAll('[class*="index-module__card"]');
-            const results = [];
-            const seenHrefs = new Set();
+            const docs = [];
+            const folders = [];
+            const seenDocs = new Set();
+            const seenFolders = new Set();
+            const processedFolderIds = new Set();
 
-            // First pass: find the folder prop on any card.  The folder
-            // prop contains the *complete* contents list (and child
-            // folders), so we only need to find it once per folder.
-            const processedFolders = new Set();
-
-            function collectFromFolder(folder, parentPath) {
-                if (!folder || processedFolders.has(folder.databaseId))
-                    return;
-                processedFolders.add(folder.databaseId);
-
-                // Build path for this folder.  The root/home folder
-                // gets an empty path; sub-folders append their name.
-                const isHome =
-                    folder.ancestors
-                    && folder.ancestors.nodes
-                    && folder.ancestors.nodes.length === 0;
-                const folderPath = isHome
-                    ? parentPath
-                    : (parentPath
-                        ? parentPath + '/' + folder.name
-                        : folder.name);
-
-                // Collect documents in this folder.
-                if (folder.contents && folder.contents.nodes) {
-                    for (const node of folder.contents.nodes) {
-                        if (node.__typename === 'SpaceDocument'
-                            && node.href && node.name
-                            && !seenHrefs.has(node.href)) {
-                            seenHrefs.add(node.href);
-                            results.push({
-                                name: node.name,
-                                href: node.href,
-                                section: folderPath,
-                            });
-                        }
-                    }
-                }
-            }
-
-            for (const card of cards) {
-                const fiberKey = Object.keys(card).find(
+            // Scan ALL elements — different dataroom layouts use
+            // different CSS classes, but the fiber prop is consistent.
+            const allEls = document.querySelectorAll('*');
+            for (const el of allEls) {
+                const fk = Object.keys(el).find(
                     k => k.startsWith('__reactFiber$')
                          || k.startsWith('__reactInternalInstance$')
                 );
-                if (!fiberKey) continue;
-                let fiber = card[fiberKey];
+                if (!fk) continue;
+                let fiber = el[fk];
                 for (let i = 0; i < 30 && fiber; i++) {
                     if (fiber.memoizedProps
                         && fiber.memoizedProps.folder
-                        && fiber.memoizedProps.folder.__typename === 'SpaceFolder') {
-                        collectFromFolder(
-                            fiber.memoizedProps.folder, '',
-                        );
+                        && fiber.memoizedProps.folder.__typename === 'SpaceFolder'
+                        && fiber.memoizedProps.folder.name
+                        && !processedFolderIds.has(
+                            fiber.memoizedProps.folder.databaseId)
+                    ) {
+                        const f = fiber.memoizedProps.folder;
+                        processedFolderIds.add(f.databaseId);
+                        if (f.contents && f.contents.nodes) {
+                            for (const n of f.contents.nodes) {
+                                if (n.__typename === 'SpaceDocument'
+                                    && n.href && n.name
+                                    && !seenDocs.has(n.href)) {
+                                    seenDocs.add(n.href);
+                                    docs.push({
+                                        name: n.name, href: n.href,
+                                    });
+                                }
+                                if (n.__typename === 'SpaceFolder'
+                                    && n.href && n.name
+                                    && !seenFolders.has(n.href)) {
+                                    seenFolders.add(n.href);
+                                    folders.push({
+                                        name: n.name, href: n.href,
+                                    });
+                                }
+                            }
+                        }
                         break;
                     }
                     fiber = fiber.return;
                 }
             }
-
-            // Fallback: if folder-based extraction found nothing,
-            // fall back to the simpler SpaceDocument-on-card approach.
-            if (results.length === 0) {
-                for (const card of cards) {
-                    const fiberKey = Object.keys(card).find(
-                        k => k.startsWith('__reactFiber$')
-                             || k.startsWith('__reactInternalInstance$')
-                    );
-                    if (!fiberKey) continue;
-                    let fiber = card[fiberKey];
-                    for (let i = 0; i < 20 && fiber; i++) {
-                        if (fiber.memoizedProps
-                            && fiber.memoizedProps.href
-                            && fiber.memoizedProps.name
-                            && fiber.memoizedProps.type === 'SpaceDocument') {
-                            const href = fiber.memoizedProps.href;
-                            if (!seenHrefs.has(href)) {
-                                seenHrefs.add(href);
-                                results.push({
-                                    name: fiber.memoizedProps.name,
-                                    href: href,
-                                    section: '',
-                                });
-                            }
-                            break;
-                        }
-                        fiber = fiber.return;
-                    }
-                }
-            }
-
-            return results;
+            return {docs, folders};
         }"""
         )
-        return docs or []
+
+    @classmethod
+    def _enumerate_documents_recursive(
+        cls,
+        page: Page,
+        base_url: str,
+        section: str = "",
+    ) -> list[dict[str, str]]:
+        """Recursively enumerate all documents in a dataroom.
+
+        Navigates into each subfolder to discover its contents,
+        building the full ``section`` path as it descends.  Returns
+        a flat list of dicts with ``name``, ``href``, and ``section``.
+        """
+        result = cls._enumerate_current_folder(page)
+        docs: list[dict[str, str]] = []
+
+        # Collect documents at this level.
+        for d in result.get("docs", []):
+            docs.append({
+                "name": d["name"],
+                "href": d["href"],
+                "section": section,
+            })
+
+        # Recurse into each subfolder.
+        for folder in result.get("folders", []):
+            folder_url = folder["href"]
+            if not folder_url.startswith("http"):
+                folder_url = "https://docsend.com" + folder_url
+            child_section = (
+                f"{section}/{folder['name']}"
+                if section
+                else folder["name"]
+            )
+            print(
+                f"[grabber]   Entering folder: "
+                f"{child_section}/"
+            )
+            page.goto(folder_url, wait_until="domcontentloaded")
+            time.sleep(2)
+            child_docs = cls._enumerate_documents_recursive(
+                page, base_url, section=child_section,
+            )
+            docs.extend(child_docs)
+
+        return docs
 
     @staticmethod
     def _check_dataroom_download(page: Page) -> bool:
@@ -630,17 +637,26 @@ class DocsendProvider(BaseProvider):
                 print(f"[grabber] Opening {url}")
                 page.goto(url, wait_until="domcontentloaded")
 
-                # Wait for the document cards to render.
+                # Handle email gate if present on the landing page.
+                self._handle_dataroom_email_gate(page, email)
+
+                # Wait for document cards / folder content to render.
+                # Different dataroom layouts use different CSS classes,
+                # so we try multiple selectors.
                 try:
                     page.wait_for_selector(
-                        '[class*="index-module__card"]',
+                        '[class*="index-module__card"], '
+                        '[class*="index-module__folder"], '
+                        '[class*="dig-Card"], '
+                        '[class*="SpaceDocument"], '
+                        '[class*="SpaceFolder"]',
                         timeout=30_000,
                     )
                 except Exception:
-                    pass  # Fall through — enumerate will return [].
+                    pass  # Fall through — enumerate will handle it.
 
-                # Small pause to let images/thumbnails finish loading.
-                time.sleep(1)
+                # Small pause to let content finish loading.
+                time.sleep(2)
 
                 # Capture landing page screenshot for the index PDF.
                 # The window is minimized, so we must restore it before
@@ -690,9 +706,8 @@ class DocsendProvider(BaseProvider):
                         f"landing page: {exc}"
                     )
 
-                doc_entries = self._enumerate_documents(page)
-
-                # Extract the dataroom/space title for the output dir.
+                # Extract the dataroom/space title for the output dir
+                # BEFORE navigating away for recursive enumeration.
                 dataroom_title = page.evaluate(
                     """() => {
                     // Try headings first.
@@ -718,6 +733,23 @@ class DocsendProvider(BaseProvider):
                 }"""
                 )
 
+                # --- Check download availability ---
+                # Check the dataroom landing page BEFORE navigating.
+                dataroom_download = self._check_dataroom_download(page)
+                if dataroom_download:
+                    print(
+                        "[grabber] Dataroom-level download "
+                        "button detected"
+                    )
+
+                # Recursively enumerate all documents and subfolders.
+                # This navigates into each subfolder, so must happen
+                # after extracting the title and landing screenshot.
+                print("[grabber] Enumerating documents …")
+                doc_entries = self._enumerate_documents_recursive(
+                    page, url,
+                )
+
                 if not doc_entries:
                     raise RuntimeError(
                         "No documents found in this dataroom.\n"
@@ -740,17 +772,10 @@ class DocsendProvider(BaseProvider):
                     for name in names:
                         print(f"[grabber]   {label}/{name}")
 
-                # --- Check download availability ---
-                # First check the dataroom landing page itself.
-                dataroom_download = self._check_dataroom_download(page)
-                if dataroom_download:
-                    print(
-                        "[grabber] Dataroom-level download "
-                        "button detected"
-                    )
-
                 # Then check on the first individual document.
                 first_url = doc_entries[0]["href"]
+                if not first_url.startswith("http"):
+                    first_url = "https://docsend.com" + first_url
                 self._navigate_and_gate(page, first_url, email=email)
                 page.wait_for_selector(
                     ".toolbar-page-indicator", timeout=30_000,
@@ -769,6 +794,8 @@ class DocsendProvider(BaseProvider):
                 for i, doc in enumerate(doc_entries):
                     t_doc = time.time()
                     doc_url = doc["href"]
+                    if not doc_url.startswith("http"):
+                        doc_url = "https://docsend.com" + doc_url
                     doc_name = doc["name"]
                     doc_section = doc.get("section", "") or ""
                     label = (
@@ -1247,6 +1274,32 @@ class DocsendProvider(BaseProvider):
                 page.click('button[type="submit"]')
                 page.wait_for_selector(
                     ".toolbar-page-indicator", timeout=15_000,
+                )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _handle_dataroom_email_gate(
+        page: Page, email: str | None,
+    ) -> None:
+        """Handle an email gate on a dataroom landing page.
+
+        Unlike single-document gates (which wait for the toolbar),
+        dataroom gates wait for card/folder content to appear.
+        """
+        try:
+            locator = page.locator('input[name="visitor[email]"]')
+            if locator.is_visible(timeout=3000):
+                gate_email = email or "viewer@example.com"
+                print("[grabber] Email gate detected – submitting")
+                locator.fill(gate_email)
+                page.click('button[type="submit"]')
+                # Dataroom pages show cards/folders, not a toolbar.
+                page.wait_for_selector(
+                    '[class*="index-module__card"], '
+                    '[class*="index-module__folder"], '
+                    '[class*="dig-Card"]',
+                    timeout=15_000,
                 )
         except Exception:
             pass
