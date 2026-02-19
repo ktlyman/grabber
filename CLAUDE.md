@@ -13,7 +13,7 @@
 - `grabber/providers/base.py` — abstract `BaseProvider` class that all providers MUST subclass
 - `grabber/providers/__init__.py` — provider registry and `detect_provider(url)` auto-detection
 - `grabber/providers/docsend.py` — DocSend provider; uses Playwright to open the viewer, extract page image URLs, download them, and compile into a PDF with img2pdf
-- `grabber/scripts/docsend_console.js` — standalone browser console script for manual extraction
+- `grabber/scripts/docsend_console.js` — browser console script for in-browser extraction; primary method for MCP/agent workflows
 
 ## Provider Development
 
@@ -29,6 +29,14 @@
 - You SHOULD prefix all user-facing print output with `[grabber]`
 - You MUST NOT hardcode page counts or document metadata; instead, detect them dynamically from the DOM
 - You MUST NOT skip rate-limit delays between page fetches; instead, use `time.sleep()` to stay polite
+
+## Known Constraints
+
+- DocSend blocks headless browsers entirely (403 on iframe and page_data API); you MUST use CDP, URL-file, or console-script mode
+- Signed CloudFront image URLs expire after ~3.5 minutes; downloads MUST use concurrent workers (default 8) to finish before expiry
+- CORS blocks in-browser `fetch()` of CloudFront image URLs; the console script works because `<img src>` bypasses CORS
+- MCP browser extensions may filter signed URLs, JWTs, and encoded data from JS return values; the console script avoids this by rendering images directly in the page
+- `window.print()` opens a modal dialog that disconnects MCP; the user must manually save the PDF from the print dialog
 
 ## Security
 

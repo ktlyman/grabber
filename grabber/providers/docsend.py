@@ -1,7 +1,7 @@
 """DocSend provider – downloads documents from docsend.com viewer URLs.
 
 DocSend blocks headless browsers from accessing document content (the viewer
-iframe and page_data API both return 403).  There are two working approaches:
+iframe and page_data API both return 403).  There are three working approaches:
 
 1. **CDP mode** (``--cdp``): Connect Playwright to an already-running Chrome
    instance launched with ``--remote-debugging-port=9222``.  The real browser
@@ -13,8 +13,19 @@ iframe and page_data API both return 403).  There are two working approaches:
    using browser automation (e.g. Claude in Chrome) to call the page_data API
    and save the URLs.
 
-In either case, the signed CloudFront image URLs are downloadable with plain
-HTTP requests — CORS only blocks in-browser ``fetch()`` from a different origin.
+3. **Console-script mode** (for MCP / browser-agent workflows): An agent
+   navigates to the DocSend URL in a real browser, runs
+   ``grabber/scripts/docsend_console.js`` via JS execution, and triggers
+   ``window.print()`` so the user can "Save as PDF".  This bypasses CORS
+   because ``<img src>`` is handled natively by the browser.
+
+In approaches 1 and 2 the signed CloudFront image URLs are downloadable with
+plain HTTP requests — CORS only blocks in-browser ``fetch()`` from a different
+origin.
+
+**Important:** Signed CloudFront image URLs expire after ~3.5 minutes.  For
+large documents, downloads are performed concurrently (configurable via
+``--workers``) to finish before expiry.
 """
 
 from __future__ import annotations
@@ -22,6 +33,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import img2pdf
@@ -47,6 +59,7 @@ class DocsendProvider(BaseProvider):
         headless: bool = True,
         cdp_url: str | None = None,
         url_file: str | None = None,
+        workers: int = 8,
     ) -> Path:
         output = Path(output)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -65,19 +78,7 @@ class DocsendProvider(BaseProvider):
         if not image_urls:
             raise RuntimeError("No page image URLs were extracted.")
 
-        # Download images — signed CloudFront URLs work with plain HTTP
-        print(f"[grabber] Downloading {len(image_urls)} pages …")
-        image_data: list[bytes] = []
-        for i, img_url in enumerate(image_urls, 1):
-            resp = requests.get(img_url, timeout=30)
-            if resp.status_code == 200:
-                image_data.append(resp.content)
-            else:
-                print(f"\n[grabber] Warning: page {i} HTTP {resp.status_code}")
-            print(f"[grabber] Downloaded page {i}/{len(image_urls)}", end="\r")
-            time.sleep(0.1)
-
-        print()
+        image_data = self._download_images(image_urls, workers=workers)
 
         if not image_data:
             raise RuntimeError("No page images were downloaded.")
@@ -88,6 +89,56 @@ class DocsendProvider(BaseProvider):
 
         print(f"[grabber] Saved to {output}")
         return output
+
+    @staticmethod
+    def _download_images(
+        image_urls: list[str], *, workers: int = 8
+    ) -> list[bytes]:
+        """Download page images concurrently.
+
+        Signed CloudFront URLs expire after ~3.5 min so we use a thread pool
+        to parallelise downloads and finish before they go stale.
+        """
+        total = len(image_urls)
+        print(f"[grabber] Downloading {total} pages ({workers} workers) …")
+
+        results: dict[int, bytes] = {}
+        failed: list[int] = []
+
+        def _fetch_one(idx: int, img_url: str) -> tuple[int, bytes | None]:
+            try:
+                resp = requests.get(img_url, timeout=30)
+                if resp.status_code == 200:
+                    return idx, resp.content
+                return idx, None
+            except requests.RequestException:
+                return idx, None
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(_fetch_one, i, u): i
+                for i, u in enumerate(image_urls)
+            }
+            done_count = 0
+            for future in as_completed(futures):
+                idx, data = future.result()
+                done_count += 1
+                if data is not None:
+                    results[idx] = data
+                else:
+                    failed.append(idx + 1)  # 1-indexed for display
+                print(
+                    f"[grabber] Downloaded {done_count}/{total}"
+                    + (f" ({len(failed)} failed)" if failed else ""),
+                    end="\r",
+                )
+
+        print()
+        if failed:
+            print(f"[grabber] Warning: failed pages: {failed}")
+
+        # Return in original page order
+        return [results[i] for i in sorted(results)]
 
     # ------------------------------------------------------------------
     # URL extraction strategies

@@ -29,6 +29,7 @@ class BaseProvider(abc.ABC):
         headless: bool = True,
         cdp_url: str | None = None,
         url_file: str | None = None,
+        workers: int = 8,
     ) -> Path:
         """Download the document at *url* and write a PDF to *output*.
 
@@ -46,6 +47,9 @@ class BaseProvider(abc.ABC):
             Optional CDP WebSocket URL to connect to an existing Chrome.
         url_file:
             Path to a JSON file containing pre-extracted image URLs.
+        workers:
+            Number of concurrent download threads (default 8).  Higher
+            values help finish before signed URLs expire (~3.5 min).
 
         Returns
         -------

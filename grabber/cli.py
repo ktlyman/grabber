@@ -48,6 +48,15 @@ def main(argv: list[str] | None = None) -> None:
             "(extracted via the console script or browser automation)."
         ),
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help=(
+            "Number of concurrent download threads (default: 8). "
+            "Higher values help finish before signed URLs expire (~3.5 min)."
+        ),
+    )
 
     args = parser.parse_args(argv)
 
@@ -64,6 +73,7 @@ def main(argv: list[str] | None = None) -> None:
         headless=not args.no_headless,
         cdp_url=args.cdp,
         url_file=args.url_file,
+        workers=args.workers,
     )
 
 
