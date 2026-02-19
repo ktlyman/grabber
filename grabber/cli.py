@@ -31,6 +31,23 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Run the browser in visible (non-headless) mode for debugging",
     )
+    parser.add_argument(
+        "--cdp",
+        default=None,
+        help=(
+            "Connect to an existing Chrome instance via CDP URL "
+            "(e.g. ws://127.0.0.1:9222). Launch Chrome with "
+            "--remote-debugging-port=9222 first."
+        ),
+    )
+    parser.add_argument(
+        "--url-file",
+        default=None,
+        help=(
+            "Path to a JSON file containing an array of signed image URLs "
+            "(extracted via the console script or browser automation)."
+        ),
+    )
 
     args = parser.parse_args(argv)
 
@@ -45,6 +62,8 @@ def main(argv: list[str] | None = None) -> None:
         output=Path(args.output),
         email=args.email,
         headless=not args.no_headless,
+        cdp_url=args.cdp,
+        url_file=args.url_file,
     )
 
 

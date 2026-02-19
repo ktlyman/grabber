@@ -27,6 +27,8 @@ class BaseProvider(abc.ABC):
         *,
         email: str | None = None,
         headless: bool = True,
+        cdp_url: str | None = None,
+        url_file: str | None = None,
     ) -> Path:
         """Download the document at *url* and write a PDF to *output*.
 
@@ -40,6 +42,10 @@ class BaseProvider(abc.ABC):
             Optional email to bypass an access gate.
         headless:
             Whether to run the browser in headless mode.
+        cdp_url:
+            Optional CDP WebSocket URL to connect to an existing Chrome.
+        url_file:
+            Path to a JSON file containing pre-extracted image URLs.
 
         Returns
         -------

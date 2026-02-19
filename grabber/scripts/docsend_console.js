@@ -87,5 +87,29 @@
 
   statusEl.innerText = "Done! Press Ctrl+P / Cmd+P to save as PDF.";
   statusEl.style.backgroundColor = "#4CAF50";
-  alert("Extraction complete. You can now print to PDF.");
+
+  // Also save a JSON file with the image URLs for use with:
+  //   grabber URL --url-file grabber_urls.json
+  const allUrls = Array.from(container.querySelectorAll("img")).map(
+    (img) => img.src
+  );
+  if (allUrls.length) {
+    const blob = new Blob([JSON.stringify(allUrls)], {
+      type: "application/json",
+    });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "grabber_urls.json";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    console.log(`Saved ${allUrls.length} image URLs to grabber_urls.json`);
+  }
+
+  alert(
+    "Extraction complete.\n\n" +
+      "Option 1: Ctrl+P / Cmd+P to print as PDF.\n" +
+      "Option 2: Use the downloaded grabber_urls.json with:\n" +
+      "  grabber URL --url-file grabber_urls.json -o output.pdf"
+  );
 })();
