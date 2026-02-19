@@ -9,17 +9,22 @@
 
 ## Architecture
 
-- `grabber/cli.py` — CLI entry point; parses args, detects the provider, and calls `fetch()`
-- `grabber/providers/base.py` — abstract `BaseProvider` class that all providers MUST subclass
+- `grabber/cli.py` — CLI entry point; parses universal args (`url`, `-o`, `--workers`), calls `add_arguments()` on each provider to register provider-specific flags, detects the provider, and passes all args to `fetch()` via `**kwargs`
+- `grabber/chrome.py` — shared Chrome lifecycle helpers: `find_chrome()`, `chrome_profile_dir()`, `clone_profile()`, `launch_chrome()`, `kill_chrome()`, `minimize_window()`, `UNSAFE_FILENAME`, `elapsed()`
+- `grabber/download.py` — shared image download + PDF compilation: `download_images()` (concurrent with retry), `compile_pdf()` (img2pdf wrapper)
+- `grabber/providers/base.py` — abstract `BaseProvider` class; defines `can_handle(url)`, `add_arguments(parser)`, and `fetch(url, output, **kwargs)`
 - `grabber/providers/__init__.py` — provider registry and `detect_provider(url)` auto-detection
-- `grabber/providers/docsend.py` — DocSend provider; handles both single documents and dataroom/folder URLs; launches system Chrome with cloned user profile, extracts page image URLs via page_data API, downloads concurrently, compiles PDF(s) with img2pdf
+- `grabber/providers/docsend.py` — DocSend provider; handles both single documents and dataroom/folder URLs; uses shared Chrome + download helpers from `grabber.chrome` and `grabber.download`
 - `grabber/scripts/docsend_console.js` — browser console script for in-browser extraction; used for manual and MCP/agent workflows
 
 ## Provider Development
 
 - You MUST create a new file in `grabber/providers/` named after the service in lowercase
-- You MUST subclass `BaseProvider` and implement `can_handle(url)` and `fetch()`
+- You MUST subclass `BaseProvider` and implement `can_handle(url)` and `fetch(url, output, **kwargs)`
 - You MUST register the provider in `grabber/providers/__init__.py` by importing it and adding it to the `PROVIDERS` dict
+- You SHOULD override `add_arguments(parser)` to register provider-specific CLI flags (e.g. `--email` for DocSend)
+- You SHOULD import from `grabber.chrome` for Chrome lifecycle management (profile cloning, launch, kill, minimize)
+- You SHOULD import from `grabber.download` for concurrent image downloading and PDF compilation
 - You SHOULD follow the existing DocSend provider pattern: launch browser, handle access gates, extract image URLs, download, compile to PDF
 
 ## Code Standards
@@ -38,8 +43,9 @@
 - MCP browser extensions may filter signed URLs, JWTs, and encoded data from JS return values; the console script avoids this by rendering images directly in the page
 - Dataroom URLs (without `/d/` in the path) are detected automatically and trigger multi-document download; each document is extracted sequentially while the browser is alive, then all images are downloaded after the browser is closed
 - Dataroom output defaults to `~/datarooms/<name>/`; a `_dataroom_index.pdf` screenshot of the landing page is saved in the root
-- Dataroom document enumeration uses React fiber props (`__reactFiber$`) on card elements; the `folder` prop (type `SpaceFolder`) higher in the fiber tree contains the complete `contents.nodes` array with all documents, plus `ancestors` and `childFolderIds` for hierarchy
+- Dataroom document enumeration uses React fiber props (`__reactFiber$`) on ALL DOM elements; the `folder` prop (type `SpaceFolder`) contains `contents.nodes` with both `SpaceDocument` and `SpaceFolder` entries, plus `ancestors` and `childFolderIds` for hierarchy
 - Dataroom folder hierarchy is replicated locally: documents in subfolders are placed in corresponding subdirectories
+- Subfolder contents require navigation — the `folder` prop only shows the current folder's direct contents; `_enumerate_documents_recursive` navigates into each subfolder URL to discover nested content
 
 ## Security
 

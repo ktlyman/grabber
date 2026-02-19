@@ -23,80 +23,23 @@ before expiry.
 
 from __future__ import annotations
 
+import argparse
 import base64
 import json
-import logging
-import os
-import platform
 import re
-import signal
 import shutil
 import subprocess
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import img2pdf
-import requests
 from playwright.sync_api import Page, sync_playwright
 
+from grabber import chrome, download
 from grabber.providers.base import BaseProvider
 
-# Suppress img2pdf alpha-channel warnings (very noisy for large documents).
-logging.getLogger("img2pdf").setLevel(logging.ERROR)
-
 _DOCSEND_PATTERN = re.compile(r"https?://(www\.)?docsend\.com/")
-_UNSAFE_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-
-
-def _elapsed(start: float) -> str:
-    """Format elapsed time since *start* as a human-readable string."""
-    secs = time.time() - start
-    if secs < 60:
-        return f"{secs:.1f}s"
-    mins = int(secs // 60)
-    remainder = secs % 60
-    return f"{mins}m {remainder:.1f}s"
-
-
-def _find_chrome() -> str | None:
-    """Locate the system Chrome binary."""
-    system = platform.system()
-    if system == "Darwin":
-        path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-        if os.path.exists(path):
-            return path
-    elif system == "Linux":
-        for name in ("google-chrome", "google-chrome-stable", "chromium-browser"):
-            path = shutil.which(name)
-            if path:
-                return path
-    elif system == "Windows":
-        for base in (
-            os.environ.get("PROGRAMFILES", ""),
-            os.environ.get("PROGRAMFILES(X86)", ""),
-            os.environ.get("LOCALAPPDATA", ""),
-        ):
-            path = os.path.join(base, "Google", "Chrome", "Application", "chrome.exe")
-            if os.path.exists(path):
-                return path
-    return None
-
-
-def _chrome_profile_dir() -> Path | None:
-    """Return the path to the user's default Chrome profile directory."""
-    system = platform.system()
-    if system == "Darwin":
-        p = Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
-    elif system == "Linux":
-        p = Path.home() / ".config" / "google-chrome"
-    elif system == "Windows":
-        local = os.environ.get("LOCALAPPDATA", "")
-        p = Path(local) / "Google" / "Chrome" / "User Data" if local else None
-    else:
-        return None
-    return p if p and p.exists() else None
 
 
 class DocsendProvider(BaseProvider):
@@ -106,20 +49,42 @@ class DocsendProvider(BaseProvider):
     def can_handle(url: str) -> bool:
         return bool(_DOCSEND_PATTERN.search(url))
 
+    @classmethod
+    def add_arguments(cls, parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--email",
+            default=None,
+            help="Email to bypass a DocSend access gate (if required)",
+        )
+        parser.add_argument(
+            "--cdp",
+            default=None,
+            help=(
+                "Connect to an existing Chrome instance via CDP URL "
+                "(e.g. ws://127.0.0.1:9222). Launch Chrome with "
+                "--remote-debugging-port=9222 first."
+            ),
+        )
+        parser.add_argument(
+            "--url-file",
+            default=None,
+            help=(
+                "Path to a JSON file containing an array of signed "
+                "image URLs (extracted via the console script or "
+                "browser automation)."
+            ),
+        )
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def fetch(
-        self,
-        url: str,
-        output: Path | None,
-        *,
-        email: str | None = None,
-        cdp_url: str | None = None,
-        url_file: str | None = None,
-        workers: int = 16,
-    ) -> Path:
+    def fetch(self, url: str, output: Path | None, **kwargs) -> Path:
+        email: str | None = kwargs.get("email")
+        cdp_url: str | None = kwargs.get("cdp")
+        url_file: str | None = kwargs.get("url_file")
+        workers: int = kwargs.get("workers", 16)
+
         if output is not None:
             output = Path(output)
             output.parent.mkdir(parents=True, exist_ok=True)
@@ -128,18 +93,22 @@ class DocsendProvider(BaseProvider):
         if url_file:
             out = output or Path("output.pdf")
             image_urls = self._load_url_file(url_file)
-            results, _ = self._download_images(image_urls, workers=workers)
+            results, _ = download.download_images(
+                image_urls, workers=workers,
+            )
             image_data = [results[i] for i in sorted(results)]
-            return self._compile_pdf(image_data, out)
+            return download.compile_pdf(image_data, out)
 
         if cdp_url:
             out = output or Path("output.pdf")
             image_urls = self._extract_urls_with_cdp(
                 url, cdp_url=cdp_url, email=email,
             )
-            results, _ = self._download_images(image_urls, workers=workers)
+            results, _ = download.download_images(
+                image_urls, workers=workers,
+            )
             image_data = [results[i] for i in sorted(results)]
-            return self._compile_pdf(image_data, out)
+            return download.compile_pdf(image_data, out)
 
         # Dataroom / folder URLs contain no ``/d/`` segment.
         if self._is_dataroom_url(url):
@@ -149,94 +118,6 @@ class DocsendProvider(BaseProvider):
 
         # Default: single-document download.
         return self._auto_fetch(url, output, email=email, workers=workers)
-
-    # ------------------------------------------------------------------
-    # Chrome lifecycle helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _clone_profile(profile_dir: Path, tmp_dir: str) -> None:
-        """Clone the user's Chrome profile into *tmp_dir*."""
-        src_default = profile_dir / "Default"
-        dst_default = Path(tmp_dir) / "Default"
-        if src_default.exists():
-            shutil.copytree(
-                src_default,
-                dst_default,
-                ignore=shutil.ignore_patterns(
-                    "Cache", "Code Cache", "GPUCache",
-                    "Service Worker", "Storage", "blob_storage",
-                    "File System", "IndexedDB", "Sessions",
-                ),
-            )
-        else:
-            dst_default.mkdir(parents=True)
-
-        for name in ("Local State",):
-            src = profile_dir / name
-            if src.exists():
-                shutil.copy2(src, Path(tmp_dir) / name)
-
-    @staticmethod
-    def _launch_chrome(
-        chrome: str, tmp_dir: str, port: int,
-    ) -> subprocess.Popen | None:
-        """Launch Chrome with remote debugging.
-
-        On macOS uses ``open -gjn`` to keep the window hidden.  Returns
-        the ``Popen`` handle on Linux/Windows, or ``None`` on macOS
-        (where Chrome is detached from our process tree).
-        """
-        if platform.system() == "Darwin":
-            subprocess.Popen(
-                [
-                    "open", "-gjn",
-                    "-a", "Google Chrome",
-                    "--args",
-                    f"--remote-debugging-port={port}",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    f"--user-data-dir={tmp_dir}",
-                    "about:blank",
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            return None
-
-        return subprocess.Popen(
-            [
-                chrome,
-                f"--remote-debugging-port={port}",
-                "--no-first-run",
-                "--no-default-browser-check",
-                f"--user-data-dir={tmp_dir}",
-                "about:blank",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-    @staticmethod
-    def _kill_chrome(
-        proc: subprocess.Popen | None, port: int,
-    ) -> None:
-        """Terminate a Chrome process launched by ``_launch_chrome``."""
-        if proc:
-            proc.terminate()
-            proc.wait(timeout=10)
-        else:
-            # macOS: ``open`` detached Chrome; find it by port.
-            try:
-                out = subprocess.check_output(
-                    ["lsof", "-ti", f":{port}"],
-                    text=True,
-                    stderr=subprocess.DEVNULL,
-                )
-                for line in out.strip().splitlines():
-                    os.kill(int(line.strip()), signal.SIGTERM)
-            except (subprocess.CalledProcessError, ValueError, OSError):
-                pass
 
     # ------------------------------------------------------------------
     # Strategy chain
@@ -251,10 +132,10 @@ class DocsendProvider(BaseProvider):
         workers: int = 16,
     ) -> Path:
         """Launch system Chrome with user profile, extract, download, compile."""
-        chrome = _find_chrome()
-        profile_dir = _chrome_profile_dir()
+        chrome_bin = chrome.find_chrome()
+        profile_dir = chrome.chrome_profile_dir()
 
-        if not chrome:
+        if not chrome_bin:
             raise RuntimeError(
                 "Could not find Google Chrome on this system.\n"
                 "Install Chrome, or use --cdp / --url-file instead."
@@ -276,27 +157,32 @@ class DocsendProvider(BaseProvider):
             # --- Step 1: Clone profile ---
             t_step = time.time()
             print("[grabber] Cloning Chrome profile …")
-            self._clone_profile(profile_dir, tmp_dir)
-            print(f"[grabber] Profile cloned ({_elapsed(t_step)})")
+            chrome.clone_profile(profile_dir, tmp_dir)
+            print(f"[grabber] Profile cloned ({chrome.elapsed(t_step)})")
 
             # --- Step 2: Launch Chrome ---
             t_step = time.time()
             print(f"[grabber] Launching Chrome (port {port}) …")
-            proc = self._launch_chrome(chrome, tmp_dir, port)
+            proc = chrome.launch_chrome(chrome_bin, tmp_dir, port)
             time.sleep(3)
-            print(f"[grabber] Chrome launched ({_elapsed(t_step)})")
+            print(f"[grabber] Chrome launched ({chrome.elapsed(t_step)})")
 
             # --- Step 3: Extract image URLs via CDP ---
             t_step = time.time()
             image_urls, title = self._extract_via_cdp_port(
                 url, port=port, email=email,
             )
-            print(f"[grabber] URL extraction finished ({_elapsed(t_step)})")
+            print(
+                f"[grabber] URL extraction finished "
+                f"({chrome.elapsed(t_step)})"
+            )
 
             # Auto-detect output filename from document title.
             if output is None:
                 if title:
-                    safe = _UNSAFE_FILENAME.sub("_", title).strip("_ ")
+                    safe = chrome.UNSAFE_FILENAME.sub(
+                        "_", title,
+                    ).strip("_ ")
                     output = Path(f"{safe}.pdf")
                     print(f"[grabber] Auto-detected filename: {output}")
                 else:
@@ -312,15 +198,18 @@ class DocsendProvider(BaseProvider):
                 )
 
             # --- Step 4: Close browser (free resources) ---
-            self._kill_chrome(proc, port)
+            chrome.kill_chrome(proc, port)
             proc = None  # Prevent double-kill in finally.
 
             # --- Step 5: Download images ---
             t_step = time.time()
-            results, failed = self._download_images(
+            results, failed = download.download_images(
                 image_urls, workers=workers,
             )
-            print(f"[grabber] Image download finished ({_elapsed(t_step)})")
+            print(
+                f"[grabber] Image download finished "
+                f"({chrome.elapsed(t_step)})"
+            )
 
             # --- Step 6: Retry failed pages with fresh URLs ---
             if failed:
@@ -332,14 +221,14 @@ class DocsendProvider(BaseProvider):
                     f"URLs …"
                 )
 
-                proc = self._launch_chrome(chrome, tmp_dir, port)
+                proc = chrome.launch_chrome(chrome_bin, tmp_dir, port)
                 time.sleep(3)
 
                 fresh_urls = self._reextract_urls(
                     url, port=port, email=email,
                     page_numbers=failed_pages,
                 )
-                self._kill_chrome(proc, port)
+                chrome.kill_chrome(proc, port)
                 proc = None
 
                 if fresh_urls:
@@ -347,8 +236,10 @@ class DocsendProvider(BaseProvider):
                         fresh_urls[idx]
                         for idx in sorted(fresh_urls)
                     ]
-                    retry_results, still_failed = self._download_images(
-                        retry_urls, workers=workers,
+                    retry_results, still_failed = (
+                        download.download_images(
+                            retry_urls, workers=workers,
+                        )
                     )
                     # Map retry results back to original indices.
                     sorted_failed = sorted(fresh_urls.keys())
@@ -364,20 +255,27 @@ class DocsendProvider(BaseProvider):
                     )
                 else:
                     print("[grabber] All pages recovered on retry")
-                print(f"[grabber] Retry finished ({_elapsed(t_step)})")
+                print(
+                    f"[grabber] Retry finished ({chrome.elapsed(t_step)})"
+                )
 
             # --- Step 7: Compile PDF ---
             t_step = time.time()
             total_pages = len(image_urls)
-            image_data = [results[i] for i in range(total_pages) if i in results]
-            result = self._compile_pdf(image_data, output)
-            print(f"[grabber] PDF compilation finished ({_elapsed(t_step)})")
+            image_data = [
+                results[i] for i in range(total_pages) if i in results
+            ]
+            result = download.compile_pdf(image_data, output)
+            print(
+                f"[grabber] PDF compilation finished "
+                f"({chrome.elapsed(t_step)})"
+            )
 
-            print(f"[grabber] Total time: {_elapsed(t_total)}")
+            print(f"[grabber] Total time: {chrome.elapsed(t_total)}")
             return result
 
         finally:
-            self._kill_chrome(proc, port)
+            chrome.kill_chrome(proc, port)
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # ------------------------------------------------------------------
@@ -579,10 +477,10 @@ class DocsendProvider(BaseProvider):
         the remote hierarchy.  A ``_dataroom_index.pdf`` screenshot of
         the landing page is saved in the root of the output directory.
         """
-        chrome = _find_chrome()
-        profile_dir = _chrome_profile_dir()
+        chrome_bin = chrome.find_chrome()
+        profile_dir = chrome.chrome_profile_dir()
 
-        if not chrome:
+        if not chrome_bin:
             raise RuntimeError(
                 "Could not find Google Chrome on this system.\n"
                 "Install Chrome, or use --cdp / --url-file instead."
@@ -603,14 +501,14 @@ class DocsendProvider(BaseProvider):
             # --- Clone profile & launch Chrome ---
             t_step = time.time()
             print("[grabber] Cloning Chrome profile …")
-            self._clone_profile(profile_dir, tmp_dir)
-            print(f"[grabber] Profile cloned ({_elapsed(t_step)})")
+            chrome.clone_profile(profile_dir, tmp_dir)
+            print(f"[grabber] Profile cloned ({chrome.elapsed(t_step)})")
 
             t_step = time.time()
             print(f"[grabber] Launching Chrome (port {port}) …")
-            proc = self._launch_chrome(chrome, tmp_dir, port)
+            proc = chrome.launch_chrome(chrome_bin, tmp_dir, port)
             time.sleep(3)
-            print(f"[grabber] Chrome launched ({_elapsed(t_step)})")
+            print(f"[grabber] Chrome launched ({chrome.elapsed(t_step)})")
 
             cdp_endpoint = f"http://127.0.0.1:{port}"
 
@@ -631,7 +529,7 @@ class DocsendProvider(BaseProvider):
                 )
                 page = context.new_page()
                 page.set_default_timeout(60_000)
-                self._minimize_window(context, page)
+                chrome.minimize_window(context, page)
 
                 # Navigate to the dataroom landing page.
                 print(f"[grabber] Opening {url}")
@@ -837,19 +735,21 @@ class DocsendProvider(BaseProvider):
                     )
                     print(
                         f"[grabber]   Extracted {len(image_urls)} "
-                        f"pages ({_elapsed(t_doc)})"
+                        f"pages ({chrome.elapsed(t_doc)})"
                     )
 
                 page.close()
 
             # --- Kill browser before downloading ---
-            self._kill_chrome(proc, port)
+            chrome.kill_chrome(proc, port)
             proc = None
 
             # --- Determine output directory ---
             if output is None:
                 dir_name = (
-                    _UNSAFE_FILENAME.sub("_", dataroom_title).strip("_ ")
+                    chrome.UNSAFE_FILENAME.sub(
+                        "_", dataroom_title,
+                    ).strip("_ ")
                     if dataroom_title
                     else None
                 )
@@ -889,7 +789,7 @@ class DocsendProvider(BaseProvider):
                 )
                 print(f"\n[grabber] Downloading: {label}")
 
-                results, failed = self._download_images(
+                results, failed = download.download_images(
                     image_urls, workers=workers,
                 )
 
@@ -902,7 +802,9 @@ class DocsendProvider(BaseProvider):
                         f"failed page URLs …"
                     )
 
-                    proc = self._launch_chrome(chrome, tmp_dir, port)
+                    proc = chrome.launch_chrome(
+                        chrome_bin, tmp_dir, port,
+                    )
                     time.sleep(3)
 
                     # Find the document URL that matches this name.
@@ -917,7 +819,7 @@ class DocsendProvider(BaseProvider):
                         email=email,
                         page_numbers=failed_pages,
                     )
-                    self._kill_chrome(proc, port)
+                    chrome.kill_chrome(proc, port)
                     proc = None
 
                     if fresh:
@@ -925,7 +827,7 @@ class DocsendProvider(BaseProvider):
                             fresh[idx] for idx in sorted(fresh)
                         ]
                         retry_results, still_failed = (
-                            self._download_images(
+                            download.download_images(
                                 retry_urls, workers=workers,
                             )
                         )
@@ -949,21 +851,23 @@ class DocsendProvider(BaseProvider):
                         print("[grabber]   All pages recovered")
                     print(
                         f"[grabber]   Retry finished "
-                        f"({_elapsed(t_retry)})"
+                        f"({chrome.elapsed(t_retry)})"
                     )
 
                 total = len(image_urls)
                 image_data = [
                     results[i] for i in range(total) if i in results
                 ]
-                safe_name = _UNSAFE_FILENAME.sub(
+                safe_name = chrome.UNSAFE_FILENAME.sub(
                     "_", doc_name,
                 ).strip("_ ")
 
                 # Place the PDF in the correct subfolder.
                 if doc_section:
                     safe_section = "/".join(
-                        _UNSAFE_FILENAME.sub("_", part).strip("_ ")
+                        chrome.UNSAFE_FILENAME.sub(
+                            "_", part,
+                        ).strip("_ ")
                         for part in doc_section.split("/")
                     )
                     doc_dir = out_dir / safe_section
@@ -972,15 +876,15 @@ class DocsendProvider(BaseProvider):
                 doc_dir.mkdir(parents=True, exist_ok=True)
 
                 doc_output = doc_dir / f"{safe_name}.pdf"
-                self._compile_pdf(image_data, doc_output)
-                print(f"[grabber]   Done ({_elapsed(t_doc)})")
+                download.compile_pdf(image_data, doc_output)
+                print(f"[grabber]   Done ({chrome.elapsed(t_doc)})")
 
             print(f"\n[grabber] Dataroom download complete: {out_dir}/")
-            print(f"[grabber] Total time: {_elapsed(t_total)}")
+            print(f"[grabber] Total time: {chrome.elapsed(t_total)}")
             return out_dir
 
         finally:
-            self._kill_chrome(proc, port)
+            chrome.kill_chrome(proc, port)
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # ------------------------------------------------------------------
@@ -1015,7 +919,7 @@ class DocsendProvider(BaseProvider):
 
             # Minimize the Chrome window before navigating so the user
             # never sees a visible browser pop up.
-            self._minimize_window(context, page)
+            chrome.minimize_window(context, page)
 
             self._navigate_and_gate(page, url, email=email)
             total_pages = self._get_total_pages(page)
@@ -1029,22 +933,6 @@ class DocsendProvider(BaseProvider):
             page.close()
 
         return image_urls, title
-
-    @staticmethod
-    def _minimize_window(context, page) -> None:
-        """Minimize the Chrome window via CDP."""
-        try:
-            cdp = context.new_cdp_session(page)
-            win = cdp.send("Browser.getWindowForTarget")
-            cdp.send(
-                "Browser.setWindowBounds",
-                {
-                    "windowId": win["windowId"],
-                    "bounds": {"windowState": "minimized"},
-                },
-            )
-        except Exception:
-            pass  # Non-critical — window stays visible.
 
     def _reextract_urls(
         self,
@@ -1068,7 +956,7 @@ class DocsendProvider(BaseProvider):
             )
             page = context.new_page()
             page.set_default_timeout(60_000)
-            self._minimize_window(context, page)
+            chrome.minimize_window(context, page)
 
             self._navigate_and_gate(page, url, email=email)
             # Wait for the viewer to load before hitting page_data.
@@ -1122,7 +1010,7 @@ class DocsendProvider(BaseProvider):
         return image_urls
 
     # ------------------------------------------------------------------
-    # Shared browser helpers
+    # DocSend browser helpers
     # ------------------------------------------------------------------
 
     @classmethod
@@ -1305,79 +1193,6 @@ class DocsendProvider(BaseProvider):
             pass
 
     # ------------------------------------------------------------------
-    # Image download (concurrent)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _download_images(
-        image_urls: list[str],
-        *,
-        workers: int = 16,
-        retries: int = 2,
-    ) -> tuple[dict[int, bytes], list[int]]:
-        """Download page images concurrently with automatic retries.
-
-        Signed CloudFront URLs expire after ~3.5 min so we use a thread pool
-        to parallelise downloads and finish before they go stale.  Failed
-        downloads are retried up to *retries* times with a short back-off.
-
-        Returns ``(results, failed)`` where *results* maps 0-based page
-        index to image bytes, and *failed* lists 0-based indices that
-        could not be downloaded.
-        """
-        total = len(image_urls)
-        print(f"[grabber] Downloading {total} pages ({workers} workers) …")
-
-        results: dict[int, bytes] = {}
-
-        def _fetch_one(idx: int, img_url: str) -> tuple[int, bytes | None]:
-            for attempt in range(1 + retries):
-                try:
-                    resp = requests.get(img_url, timeout=30)
-                    if resp.status_code == 200:
-                        return idx, resp.content
-                except requests.RequestException:
-                    pass
-                if attempt < retries:
-                    time.sleep(1 * (attempt + 1))
-            return idx, None
-
-        failed: list[int] = []
-
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {
-                pool.submit(_fetch_one, i, u): i
-                for i, u in enumerate(image_urls)
-            }
-            done_count = 0
-            for future in as_completed(futures):
-                idx, data = future.result()
-                done_count += 1
-                if data is not None:
-                    results[idx] = data
-                else:
-                    failed.append(idx)
-                print(
-                    f"[grabber] Downloaded {done_count}/{total}"
-                    + (
-                        f" ({len(failed)} failed)"
-                        if failed
-                        else ""
-                    ),
-                    end="\r",
-                )
-
-        print()
-        if failed:
-            failed.sort()
-            print(
-                f"[grabber] Warning: failed pages: "
-                f"{[i + 1 for i in failed]}"
-            )
-
-        return results, failed
-
-    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
@@ -1388,14 +1203,3 @@ class DocsendProvider(BaseProvider):
             urls = json.load(f)
         print(f"[grabber] Loaded {len(urls)} URLs from {path}")
         return urls
-
-    @staticmethod
-    def _compile_pdf(image_data: list[bytes], output: Path) -> Path:
-        """Compile downloaded image bytes into a PDF with img2pdf."""
-        if not image_data:
-            raise RuntimeError("No page images were downloaded.")
-        print(f"[grabber] Compiling {len(image_data)} pages into PDF …")
-        with open(output, "wb") as f:
-            f.write(img2pdf.convert(image_data))
-        print(f"[grabber] Saved to {output}")
-        return output

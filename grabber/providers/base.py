@@ -8,6 +8,7 @@ this package that subclasses ``BaseProvider`` and register it in
 from __future__ import annotations
 
 import abc
+import argparse
 from pathlib import Path
 
 
@@ -19,17 +20,17 @@ class BaseProvider(abc.ABC):
     def can_handle(url: str) -> bool:
         """Return True if this provider knows how to handle *url*."""
 
+    @classmethod
+    def add_arguments(cls, parser: argparse.ArgumentParser) -> None:
+        """Register provider-specific CLI arguments.
+
+        Override in subclasses to add flags like ``--email`` or
+        ``--cookie-file``.  The *parser* is an argument group scoped
+        to this provider, so flags are visually grouped in ``--help``.
+        """
+
     @abc.abstractmethod
-    def fetch(
-        self,
-        url: str,
-        output: Path | None,
-        *,
-        email: str | None = None,
-        cdp_url: str | None = None,
-        url_file: str | None = None,
-        workers: int = 16,
-    ) -> Path:
+    def fetch(self, url: str, output: Path | None, **kwargs) -> Path:
         """Download the document at *url* and write a PDF to *output*.
 
         Parameters
@@ -39,15 +40,9 @@ class BaseProvider(abc.ABC):
         output:
             Destination file path for the resulting PDF.  If ``None``,
             the provider should auto-detect a filename from the document.
-        email:
-            Optional email to bypass an access gate.
-        cdp_url:
-            Optional CDP WebSocket URL to connect to an existing Chrome.
-        url_file:
-            Path to a JSON file containing pre-extracted image URLs.
-        workers:
-            Number of concurrent download threads (default 16).  Higher
-            values help finish before signed URLs expire (~3.5 min).
+        **kwargs:
+            Provider-specific options from CLI arguments.  Each provider
+            picks out the keys it registered via :meth:`add_arguments`.
 
         Returns
         -------

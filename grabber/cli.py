@@ -6,7 +6,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from grabber.providers import detect_provider
+from grabber.providers import PROVIDERS, detect_provider
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -27,28 +27,6 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     parser.add_argument(
-        "--email",
-        default=None,
-        help="Email to bypass an access gate (if required)",
-    )
-    parser.add_argument(
-        "--cdp",
-        default=None,
-        help=(
-            "Connect to an existing Chrome instance via CDP URL "
-            "(e.g. ws://127.0.0.1:9222). Launch Chrome with "
-            "--remote-debugging-port=9222 first."
-        ),
-    )
-    parser.add_argument(
-        "--url-file",
-        default=None,
-        help=(
-            "Path to a JSON file containing an array of signed image URLs "
-            "(extracted via the console script or browser automation)."
-        ),
-    )
-    parser.add_argument(
         "--workers",
         type=int,
         default=16,
@@ -58,6 +36,11 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
 
+    # Let each provider register its own flags in a named group.
+    for name, cls in PROVIDERS.items():
+        group = parser.add_argument_group(f"{name} options")
+        cls.add_arguments(group)
+
     args = parser.parse_args(argv)
 
     provider_cls = detect_provider(args.url)
@@ -66,14 +49,13 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(1)
 
     provider = provider_cls()
-    provider.fetch(
-        url=args.url,
-        output=Path(args.output) if args.output else None,
-        email=args.email,
-        cdp_url=args.cdp,
-        url_file=args.url_file,
-        workers=args.workers,
-    )
+    kwargs = vars(args)
+    # Pop universal args that fetch() takes as positional/explicit params.
+    url = kwargs.pop("url")
+    output_raw = kwargs.pop("output")
+    output = Path(output_raw) if output_raw else None
+
+    provider.fetch(url=url, output=output, **kwargs)
 
 
 if __name__ == "__main__":
