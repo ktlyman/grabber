@@ -18,8 +18,13 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "-o",
         "--output",
-        default="output.pdf",
-        help="Output PDF path (default: output.pdf)",
+        default=None,
+        help=(
+            "Output path. For single docs: PDF file path "
+            "(default: auto-detected from title). "
+            "For datarooms: directory path "
+            "(default: ~/datarooms/<name>/)."
+        ),
     )
     parser.add_argument(
         "--email",
@@ -46,9 +51,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--workers",
         type=int,
-        default=8,
+        default=16,
         help=(
-            "Number of concurrent download threads (default: 8). "
+            "Number of concurrent download threads (default: 16). "
             "Higher values help finish before signed URLs expire (~3.5 min)."
         ),
     )
@@ -63,7 +68,7 @@ def main(argv: list[str] | None = None) -> None:
     provider = provider_cls()
     provider.fetch(
         url=args.url,
-        output=Path(args.output),
+        output=Path(args.output) if args.output else None,
         email=args.email,
         cdp_url=args.cdp,
         url_file=args.url_file,

@@ -26,19 +26,29 @@ playwright install chromium
 ### CLI
 
 ```bash
-# Just works — launches Chrome, extracts images, compiles PDF
-grabber "https://docsend.com/view/ABCDEF" -o deck.pdf
+# Single document — auto-detects filename
+grabber "https://docsend.com/view/ABCDEF" --email you@example.com
 
-# Bypass email gate
+# Explicit output path
 grabber "https://docsend.com/view/ABCDEF" --email you@example.com -o deck.pdf
+
+# Dataroom / folder — downloads all documents into ~/datarooms/<name>/
+grabber "https://docsend.com/view/SLUG" --email you@example.com
+# Creates: ~/datarooms/Space_Name/
+#   _dataroom_index.pdf          (landing page screenshot)
+#   Doc_1.pdf                    (root-level document)
+#   SubFolder/Doc_2.pdf          (document in a subfolder)
+
+# Dataroom with explicit output directory
+grabber "https://docsend.com/view/SLUG" --email you@example.com -o ./my-folder
 ```
 
 That's it. The tool automatically:
 1. Clones your Chrome profile to a temp directory (for session cookies)
 2. Launches Chrome with remote debugging
 3. Navigates to the DocSend URL and handles the email gate
-4. Extracts all page image URLs via the page_data API
-5. Downloads images concurrently (8 threads by default)
+4. Extracts all page image URLs via the page_data API (concurrent `Promise.all`)
+5. Downloads images concurrently (16 threads by default)
 6. Compiles them into a PDF with img2pdf
 7. Closes Chrome and cleans up
 
@@ -79,8 +89,8 @@ grabber URL --cdp ws://127.0.0.1:9222 -o deck.pdf
 # Use pre-extracted image URLs (from console script or browser automation)
 grabber URL --url-file grabber_urls.json -o deck.pdf
 
-# More download threads (default 8) — useful for large documents
-grabber URL --url-file urls.json --workers 16
+# Adjust download threads (default 16)
+grabber URL --url-file urls.json --workers 32
 ```
 
 ### Browser console (manual fallback)

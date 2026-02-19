@@ -23,13 +23,12 @@ class BaseProvider(abc.ABC):
     def fetch(
         self,
         url: str,
-        output: Path,
+        output: Path | None,
         *,
         email: str | None = None,
-        headless: bool = True,
         cdp_url: str | None = None,
         url_file: str | None = None,
-        workers: int = 8,
+        workers: int = 16,
     ) -> Path:
         """Download the document at *url* and write a PDF to *output*.
 
@@ -38,21 +37,21 @@ class BaseProvider(abc.ABC):
         url:
             The viewer URL (e.g. a DocSend link).
         output:
-            Destination file path for the resulting PDF.
+            Destination file path for the resulting PDF.  If ``None``,
+            the provider should auto-detect a filename from the document.
         email:
             Optional email to bypass an access gate.
-        headless:
-            Whether to run the browser in headless mode.
         cdp_url:
             Optional CDP WebSocket URL to connect to an existing Chrome.
         url_file:
             Path to a JSON file containing pre-extracted image URLs.
         workers:
-            Number of concurrent download threads (default 8).  Higher
+            Number of concurrent download threads (default 16).  Higher
             values help finish before signed URLs expire (~3.5 min).
 
         Returns
         -------
         Path
-            The path to the written PDF.
+            The path to the written PDF, or a directory containing
+            multiple PDFs for multi-document sources (e.g. datarooms).
         """
