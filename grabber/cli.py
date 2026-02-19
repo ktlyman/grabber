@@ -27,11 +27,6 @@ def main(argv: list[str] | None = None) -> None:
         help="Email to bypass an access gate (if required)",
     )
     parser.add_argument(
-        "--no-headless",
-        action="store_true",
-        help="Run the browser in visible (non-headless) mode for debugging",
-    )
-    parser.add_argument(
         "--cdp",
         default=None,
         help=(
@@ -70,7 +65,6 @@ def main(argv: list[str] | None = None) -> None:
         url=args.url,
         output=Path(args.output),
         email=args.email,
-        headless=not args.no_headless,
         cdp_url=args.cdp,
         url_file=args.url_file,
         workers=args.workers,
