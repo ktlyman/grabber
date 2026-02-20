@@ -26,7 +26,7 @@ jobs:
           node-version: '20'
 
       - name: Run claude-md-lint
-        run: npx github:LaymanAI/linter . --fail-under 80 --sarif > results.sarif
+        run: npx claude-md-lint@1 . --fail-under 80 --sarif > results.sarif
 
       - name: Upload SARIF
         if: always() && github.event_name == 'pull_request'
